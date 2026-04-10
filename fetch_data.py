@@ -1,7 +1,7 @@
 """
 Haus & Kinder — Unicommerce Data Fetcher
 Runs every hour via GitHub Actions.
-Fetches Sale Orders, Shipping Packages, Returns, and Inventory data.
+Fetches Sale Orders and Inventory Snapshot data.
 Merges with master files and saves JSON to /data/ folder.
 """
 
@@ -45,11 +45,9 @@ def get_access_token():
 # ── STEP 2: CREATE EXPORT JOB ────────────────────────────────────────────────
 def create_export_job(token, job_type, from_date, to_date):
     """
-    job_type options:
-      - SALE_ORDER_REPORT
-      - SHIPMENT_REPORT
-      - RETURN_REPORT
-      - INVENTORY_SNAPSHOT
+    job_type options confirmed by Unicommerce:
+      - Sale Orders
+      - Inventory Snapshot
     """
     print(f"📤 Creating export job: {job_type} from {from_date} to {to_date}")
     url = f"{BASE_URL}/services/rest/v1/export/createExportJob"
@@ -117,13 +115,13 @@ def parse_csv(csv_text):
 # ── STEP 6: LOAD MASTER FILES ────────────────────────────────────────────────
 def load_masters():
     """
-    Loads master Excel files from /masters/ folder in the repo.
-    Returns lookup dictionaries for fast merging.
+    Loads master Excel files from the repo root.
+    Update these files in GitHub anytime — changes take effect on next run.
     """
     try:
         import openpyxl
     except ImportError:
-        os.system("pip install openpyxl --break-system-packages -q")
+        os.system("pip install openpyxl -q")
         import openpyxl
 
     masters = {}
@@ -134,7 +132,7 @@ def load_masters():
         wb = openpyxl.load_workbook(cat_path, data_only=True)
         ws = wb.active
         headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-        category_map = {}  # SKU -> {category, sub_category, cogs, weight}
+        category_map = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not row[0]:
                 continue
@@ -152,7 +150,7 @@ def load_masters():
         masters["category"] = category_map
         print(f"✅ Category master loaded: {len(category_map)} SKUs")
     else:
-        print("⚠️  Category master not found at Category_Wise_Inventory.xlsx")
+        print("⚠️  Category master not found.")
         masters["category"] = {}
 
     # --- States & Cities Master ---
@@ -161,7 +159,7 @@ def load_masters():
         wb = openpyxl.load_workbook(state_path, data_only=True)
         ws = wb.active
         headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-        pincode_map = {}  # Pincode -> {city, state, zone, tier}
+        pincode_map = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not row[0]:
                 continue
@@ -182,7 +180,7 @@ def load_masters():
         masters["pincode"] = pincode_map
         print(f"✅ States & Cities master loaded: {len(pincode_map)} pincodes")
     else:
-        print("⚠️  States master not found at States and Cities.xlsx")
+        print("⚠️  States master not found.")
         masters["pincode"] = {}
 
     # --- Channel Master ---
@@ -191,7 +189,7 @@ def load_masters():
         wb = openpyxl.load_workbook(ch_path, data_only=True)
         ws = wb.active
         headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-        channel_map = {}  # Channel Name -> {type, abbr, b2b_b2c}
+        channel_map = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not row[0]:
                 continue
@@ -209,40 +207,41 @@ def load_masters():
         masters["channel"] = channel_map
         print(f"✅ Channel master loaded: {len(channel_map)} channels")
     else:
-        print("⚠️  Channel master not found at Channel Master.xlsx")
+        print("⚠️  Channel master not found.")
         masters["channel"] = {}
 
     return masters
 
 
-# ── STEP 7: ENRICH ROWS WITH MASTER DATA ────────────────────────────────────
+# ── STEP 7: ENRICH ORDERS WITH MASTER DATA ───────────────────────────────────
 def enrich_orders(orders, masters):
     """Add category, channel, state info to each order row."""
     enriched = []
     for row in orders:
-        # Get SKU info
+        # SKU info
         sku = str(row.get("SKU Code", "") or row.get("Item SKU", "") or "").strip()
         cat_info = masters["category"].get(sku, {
             "category": "Unknown", "sub_category": "Unknown", "cogs": 0, "weight": 0
         })
 
-        # Get channel info
+        # Channel info
         channel = str(row.get("Channel", "") or row.get("Facility", "") or "").strip()
         ch_info = masters["channel"].get(channel, {
             "channel_type": "Unknown", "channel_abbr": channel,
             "channel_display": channel, "b2b_b2c": "B2C"
         })
 
-        # Get pincode/state info
+        # Pincode / state info
         pincode = str(row.get("Customer Pincode", "") or row.get("Pincode", "") or "").strip()
         try:
             pincode = str(int(float(pincode)))
         except:
             pass
         state_info = masters["pincode"].get(pincode, {
-            "city": row.get("Customer City", "Unknown"),
+            "city":  row.get("Customer City", "Unknown"),
             "state": row.get("Customer State", "Unknown"),
-            "zone": "Unknown", "tier": "Unknown"
+            "zone":  "Unknown",
+            "tier":  "Unknown"
         })
 
         # Order value bucket
@@ -298,31 +297,25 @@ def main():
     print(f"🚀 HK Dashboard Fetch — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60 + "\n")
 
-    # Date range
     to_date   = datetime.now().strftime("%Y-%m-%d")
     from_date = (datetime.now() - timedelta(days=DAYS_BACK)).strftime("%Y-%m-%d")
     print(f"📅 Fetching data from {from_date} to {to_date}\n")
 
-    # Get token
     token = get_access_token()
 
-    # Load masters
     print("\n📚 Loading master files...")
     masters = load_masters()
 
-    # Save master summaries as JSON (for dashboard dropdowns)
+    # Save master summaries for dashboard dropdowns
     save_json(list(masters["channel"].values()), "channels.json")
-    save_json(
-        [{"sku": k, **v} for k, v in masters["category"].items()],
-        "skus.json"
-    )
+    save_json([{"sku": k, **v} for k, v in masters["category"].items()], "skus.json")
 
     results = {}
 
     # ── Sale Orders ──────────────────────────────────────────────────────────
     try:
         print("\n📦 Fetching Sale Orders...")
-        job_id = create_export_job(token, "SALE_ORDER_REPORT", from_date, to_date)
+        job_id = create_export_job(token, "Sale Orders", from_date, to_date)
         dl_url = wait_for_export(token, job_id)
         csv_text = download_csv(token, dl_url)
         orders = parse_csv(csv_text)
@@ -333,40 +326,13 @@ def main():
         print(f"❌ Sale Orders failed: {e}")
         results["sale_orders"] = f"ERROR: {e}"
 
-    # ── Shipping Packages ─────────────────────────────────────────────────────
-    try:
-        print("\n🚚 Fetching Shipping Packages...")
-        job_id = create_export_job(token, "SHIPMENT_REPORT", from_date, to_date)
-        dl_url = wait_for_export(token, job_id)
-        csv_text = download_csv(token, dl_url)
-        shipments = parse_csv(csv_text)
-        save_json(shipments, "shipments.json")
-        results["shipments"] = len(shipments)
-    except Exception as e:
-        print(f"❌ Shipments failed: {e}")
-        results["shipments"] = f"ERROR: {e}"
-
-    # ── Returns ───────────────────────────────────────────────────────────────
-    try:
-        print("\n↩️  Fetching Returns...")
-        job_id = create_export_job(token, "RETURN_REPORT", from_date, to_date)
-        dl_url = wait_for_export(token, job_id)
-        csv_text = download_csv(token, dl_url)
-        returns = parse_csv(csv_text)
-        save_json(returns, "returns.json")
-        results["returns"] = len(returns)
-    except Exception as e:
-        print(f"❌ Returns failed: {e}")
-        results["returns"] = f"ERROR: {e}"
-
     # ── Inventory Snapshot ────────────────────────────────────────────────────
     try:
         print("\n🏭 Fetching Inventory Snapshot...")
-        job_id = create_export_job(token, "INVENTORY_SNAPSHOT", from_date, to_date)
+        job_id = create_export_job(token, "Inventory Snapshot", from_date, to_date)
         dl_url = wait_for_export(token, job_id)
         csv_text = download_csv(token, dl_url)
         inventory = parse_csv(csv_text)
-        # Enrich with category/COGS info
         for item in inventory:
             sku = str(item.get("SKU Code", "") or "").strip()
             cat_info = masters["category"].get(sku, {
@@ -381,11 +347,11 @@ def main():
         print(f"❌ Inventory failed: {e}")
         results["inventory"] = f"ERROR: {e}"
 
-    # ── Save metadata ─────────────────────────────────────────────────────────
+    # ── Metadata ──────────────────────────────────────────────────────────────
     metadata = {
-        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "from_date": from_date,
-        "to_date": to_date,
+        "last_updated":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "from_date":     from_date,
+        "to_date":       to_date,
         "record_counts": results
     }
     save_json(metadata, "metadata.json")
